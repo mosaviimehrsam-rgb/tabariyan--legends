@@ -1,98 +1,143 @@
-
 import os
 import sqlite3
+import secrets
 from functools import wraps
+from datetime import datetime
 
 from flask import (
-    Flask, request, redirect, url_for,
-    session, flash, render_template_string, g
+    Flask, request, redirect, url_for, session,
+    flash, render_template_string, send_from_directory
 )
-from werkzeug.security import (
-    generate_password_hash,
-    check_password_hash
-)
+from flask_socketio import SocketIO, emit, join_room
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
-# ---------------- APP SETTINGS ----------------
+
+# ==================================================
+# SETTINGS
+# ==================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "tabariyan.db")
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
 app.secret_key = os.environ.get(
-    "SECRET_KEY", "tabariyan-local-secret-key"
+    "SECRET_KEY",
+    secrets.token_hex(32)
 )
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATABASE = os.path.join(BASE_DIR, "tabariyan.db")
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+app.config["UPLOAD_FOLDER"] = UPLOAD_DIR
+
+socketio = SocketIO(app, cors_allowed_origins=[])
 
 ADMIN_USERNAME = os.environ.get(
     "ADMIN_USERNAME", "mehrsam_admin"
 )
 
-# ---------------- ADMIN BLUEPRINT ----------------
+ADMIN_PASSWORD = os.environ.get(
+    "ADMIN_PASSWORD", "ChangeMe123!"
+)
 
-from admin import admin_bp
-app.register_blueprint(admin_bp)
-
-
-# ---------------- DATABASE ----------------
-
-def db():
-    if "database" not in g:
-        g.database = sqlite3.connect(DATABASE)
-        g.database.row_factory = sqlite3.Row
-    return g.database
+online_users = {}
 
 
-@app.teardown_appcontext
-def close_db(error=None):
-    database = g.pop("database", None)
-    if database is not None:
-        database.close()
+# ==================================================
+# DATABASE
+# ==================================================
+
+def get_db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def add_missing_columns(con, table, columns):
+    existing = {
+        row["name"]
+        for row in con.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    }
+
+    for name, definition in columns.items():
+        if name not in existing:
+            con.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+            )
 
 
 def init_db():
-    con = sqlite3.connect(DATABASE)
+    con = get_db()
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            phone TEXT,
-            password TEXT NOT NULL,
-            matches INTEGER DEFAULT 0,
-            goals INTEGER DEFAULT 0,
-            assists INTEGER DEFAULT 0,
-            clean_sheets INTEGER DEFAULT 0,
-            yellow_cards INTEGER DEFAULT 0,
-            red_cards INTEGER DEFAULT 0,
-            rating REAL DEFAULT 0,
-            role TEXT DEFAULT 'player'
-        )
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        fullname TEXT DEFAULT '',
+        position TEXT DEFAULT '',
+        number INTEGER DEFAULT 0,
+        goals INTEGER DEFAULT 0,
+        assists INTEGER DEFAULT 0,
+        is_admin INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL,
+        receiver TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS news (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        content TEXT DEFAULT '',
+        poster TEXT DEFAULT '',
+        author TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     """)
 
-    columns = [
-        row[1] for row in con.execute(
-            "PRAGMA table_info(users)"
-        ).fetchall()
-    ]
+    # فقط ستون‌هایی که در دیتابیس قدیمی وجود ندارند اضافه می‌شوند.
+    # مقدارهای DEFAULT در این بخش باید ثابت باشند.
 
-    if "role" not in columns:
-        con.execute("""
-            ALTER TABLE users
-            ADD COLUMN role TEXT DEFAULT 'player'
-        """)
+    add_missing_columns(con, "users", {
+        "username": "TEXT DEFAULT ''",
+        "password": "TEXT DEFAULT ''",
+        "fullname": "TEXT DEFAULT ''",
+        "position": "TEXT DEFAULT ''",
+        "number": "INTEGER DEFAULT 0",
+        "goals": "INTEGER DEFAULT 0",
+        "assists": "INTEGER DEFAULT 0",
+        "is_admin": "INTEGER DEFAULT 0",
+        "created_at": "TEXT DEFAULT ''"
+    })
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            opponent TEXT NOT NULL,
-            score TEXT NOT NULL,
-            result TEXT NOT NULL,
-            match_date TEXT
-        )
-    """)
+    add_missing_columns(con, "messages", {
+        "sender": "TEXT DEFAULT ''",
+        "receiver": "TEXT DEFAULT 'TEAM'",
+        "message": "TEXT DEFAULT ''",
+        "created_at": "TEXT DEFAULT ''"
+    })
 
-    admin_password = os.environ.get("ADMIN_PASSWORD")
+    add_missing_columns(con, "news", {
+        "title": "TEXT DEFAULT ''",
+        "content": "TEXT DEFAULT ''",
+        "poster": "TEXT DEFAULT ''",
+        "author": "TEXT DEFAULT ''",
+        "created_at": "TEXT DEFAULT ''"
+    })
 
+    # ایجاد مدیر اولیه، فقط اگر وجود نداشته باشد.
     admin = con.execute(
         "SELECT id FROM users WHERE username=?",
         (ADMIN_USERNAME,)
@@ -100,26 +145,18 @@ def init_db():
 
     if admin:
         con.execute(
-            "UPDATE users SET role='admin' WHERE username=?",
+            "UPDATE users SET is_admin=1 WHERE username=?",
             (ADMIN_USERNAME,)
         )
-
-        if admin_password:
-            con.execute(
-                "UPDATE users SET password=? WHERE username=?",
-                (
-                    generate_password_hash(admin_password),
-                    ADMIN_USERNAME
-                )
-            )
-
-    elif admin_password:
+    else:
         con.execute("""
-            INSERT INTO users (username, password, role)
-            VALUES (?, ?, 'admin')
+            INSERT INTO users
+            (username, password, fullname, is_admin)
+            VALUES (?, ?, ?, 1)
         """, (
             ADMIN_USERNAME,
-            generate_password_hash(admin_password)
+            generate_password_hash(ADMIN_PASSWORD),
+            "مدیریت TABARIYAN LEGENDS"
         ))
 
     con.commit()
@@ -129,365 +166,290 @@ def init_db():
 init_db()
 
 
-# ---------------- LOGIN REQUIRED ----------------
+# ==================================================
+# DESIGN
+# ==================================================
 
-def login_required(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if "user_id" not in session:
-            flash("ابتدا وارد حساب خود شوید.")
-            return redirect(url_for("login"))
-        return func(*args, **kwargs)
-    return wrapper
-
-
-# ---------------- DESIGN ----------------
-
-BASE_STYLE = """
+STYLE = """
 <style>
-* { box-sizing: border-box; }
+* { box-sizing:border-box; }
 
 body {
-    margin: 0;
-    background: #071426;
-    color: white;
-    font-family: Tahoma, Arial, sans-serif;
-    direction: rtl;
+    margin:0;
+    direction:rtl;
+    font-family:Tahoma,Arial,sans-serif;
+    background:#071629;
+    color:white;
 }
-
-header {
-    background: #102b4c;
-    padding: 22px;
-    text-align: center;
-    border-bottom: 4px solid #e63946;
-}
-
-header h1 {
-    margin: 0;
-    color: white;
-    font-size: 29px;
-}
-
-header p { color: #b9d8ff; }
 
 nav {
-    background: #0b1e35;
-    padding: 15px;
-    text-align: center;
+    background:#0d2745;
+    padding:15px;
+    display:flex;
+    flex-wrap:wrap;
+    justify-content:center;
+    gap:12px;
+    border-bottom:2px solid #e63950;
 }
 
 nav a {
-    color: white;
-    text-decoration: none;
-    margin: 8px;
-    font-size: 14px;
+    color:white;
+    text-decoration:none;
+    padding:8px;
 }
 
-nav a:hover { color: #ff4757; }
+nav a:hover { color:#ff5367; }
 
 .container {
-    width: 92%;
-    max-width: 1000px;
-    margin: 30px auto;
+    max-width:1050px;
+    margin:25px auto;
+    padding:15px;
 }
+
+.hero {
+    background:linear-gradient(135deg,#123d69,#a51f39);
+    padding:35px 20px;
+    text-align:center;
+    border-radius:18px;
+    margin-bottom:20px;
+}
+
+.hero h1 { font-size:30px; }
 
 .card {
-    background: #102b4c;
-    border: 1px solid #24466c;
-    border-radius: 13px;
-    padding: 22px;
-    margin-bottom: 20px;
+    background:#102b49;
+    border:1px solid #25496c;
+    border-radius:14px;
+    padding:20px;
+    margin-bottom:18px;
 }
 
-h2 { color: #ff4757; }
+h2 { color:#ff5367; }
 
-input, button {
-    width: 100%;
-    padding: 13px;
-    margin: 9px 0;
-    border-radius: 8px;
-    border: none;
-    font-family: Tahoma;
+input,textarea,select {
+    width:100%;
+    padding:13px;
+    margin:8px 0;
+    border:1px solid #31577e;
+    border-radius:8px;
+    background:#071629;
+    color:white;
+    font-family:inherit;
 }
 
-input {
-    background: #eaf2ff;
-    color: #111;
+textarea {
+    min-height:110px;
+    resize:vertical;
 }
 
-button {
-    background: #e63946;
-    color: white;
-    font-size: 16px;
-    cursor: pointer;
+button,.btn {
+    display:inline-block;
+    padding:12px 18px;
+    border:0;
+    border-radius:8px;
+    background:#e63950;
+    color:white;
+    cursor:pointer;
+    text-decoration:none;
+    font-family:inherit;
+    margin:5px 0;
 }
 
-button:hover { background: #b91c2a; }
+button:hover,.btn:hover { background:#bd263d; }
 
-a.btn {
-    display: inline-block;
-    background: #e63946;
-    color: white;
-    padding: 12px 20px;
-    text-decoration: none;
-    border-radius: 8px;
-    margin: 5px;
-}
-
-.stat-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-    gap: 12px;
-}
-
-.stat {
-    background: #071426;
-    padding: 17px;
-    border-radius: 10px;
-    text-align: center;
-}
-
-.stat strong {
-    display: block;
-    font-size: 24px;
-    color: #ff4757;
-    margin-top: 8px;
+.grid {
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+    gap:15px;
 }
 
 .player {
-    background: #071426;
-    border-right: 4px solid #e63946;
-    padding: 15px;
-    margin: 12px 0;
-    border-radius: 8px;
+    background:#0b2038;
+    border:1px solid #294b6d;
+    padding:18px;
+    border-radius:12px;
+    margin-bottom:10px;
+}
+
+.player a {
+    color:white;
+    text-decoration:none;
+}
+
+.poster {
+    width:100%;
+    max-height:400px;
+    object-fit:contain;
+    border-radius:10px;
+    margin-top:10px;
 }
 
 .message {
-    background: #24466c;
-    padding: 12px;
-    border-radius: 8px;
-    margin: 10px 0;
+    background:#163858;
+    padding:12px;
+    margin:9px 0;
+    border-radius:10px;
+    overflow-wrap:anywhere;
+}
+
+.message small { color:#a9c2d8; }
+
+#messages {
+    height:350px;
+    overflow-y:auto;
+    background:#081a2d;
+    padding:12px;
+    border-radius:10px;
+}
+
+video {
+    width:100%;
+    background:black;
+    border-radius:10px;
+    margin:5px 0;
+}
+
+.flash {
+    background:#7c2535;
+    padding:12px;
+    border-radius:8px;
+    margin:10px 0;
 }
 
 footer {
-    text-align: center;
-    padding: 25px;
-    color: #9bb5d1;
+    text-align:center;
+    padding:25px;
+    color:#9db3c9;
 }
 
 @media(max-width:600px) {
-    header h1 { font-size: 21px; }
-    nav a { display: inline-block; }
+    .hero h1 { font-size:22px; }
+    nav { gap:5px; }
+    nav a { font-size:12px; }
 }
 </style>
 """
 
+NAV = """
+<nav>
+    <a href="/">خانه</a>
+    <a href="/players">بازیکنان</a>
+    <a href="/news">اخبار</a>
+    <a href="/chat">پیام‌رسان</a>
+    <a href="/call">تماس</a>
 
-# ---------------- PAGE FUNCTION ----------------
+    {% if session.get('user') %}
+        <a href="/profile">پروفایل</a>
+        <a href="/logout">خروج</a>
+    {% else %}
+        <a href="/login">ورود</a>
+        <a href="/register">ثبت‌نام</a>
+    {% endif %}
 
-def page(title, content):
+    {% if session.get('admin') %}
+        <a href="/admin">مدیریت</a>
+    {% endif %}
+</nav>
+"""
+
+
+def page(content, **context):
+    body = render_template_string(content, **context)
+
     return render_template_string("""
     <!DOCTYPE html>
     <html lang="fa">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport"
-              content="width=device-width, initial-scale=1.0">
-        <title>{{ title }} | TABARIYAN LEGENDS</title>
-        """ + BASE_STYLE + """
+              content="width=device-width, initial-scale=1">
+        <title>TABARIYAN LEGENDS</title>
+        """ + STYLE + """
     </head>
     <body>
-
-    <header>
-        <h1>💙 TABARIYAN LEGENDS ❤️</h1>
-        <p>OFFICIAL FOOTBALL TEAM WEBSITE</p>
-    </header>
-
-    <nav>
-        <a href="{{ url_for('home') }}">خانه</a>
-        <a href="{{ url_for('players') }}">بازیکنان</a>
-        <a href="{{ url_for('matches') }}">مسابقات</a>
-
-        {% if session.get('user_id') %}
-            <a href="{{ url_for('dashboard') }}">حساب من</a>
-
-            {% if session.get('role') == 'admin' %}
-                <a href="{{ url_for('admin_panel.dashboard') }}">
-                    مدیریت
-                </a>
-            {% endif %}
-
-            <a href="{{ url_for('logout') }}">خروج</a>
-        {% else %}
-            <a href="{{ url_for('login') }}">ورود</a>
-            <a href="{{ url_for('register') }}">ثبت نام</a>
-        {% endif %}
-    </nav>
-
-    <div class="container">
-
-        {% with messages = get_flashed_messages() %}
-            {% for message in messages %}
-                <div class="message">{{ message }}</div>
-            {% endfor %}
-        {% endwith %}
-
-        """ + content + """
-
-    </div>
-
-    <footer>
-        TABARIYAN LEGENDS © 2026
-        <br>
-        OFFICIAL WEBSITE
-    </footer>
-
+        """ + NAV + """
+        <div class="container">
+            {% with items=get_flashed_messages() %}
+                {% for item in items %}
+                    <div class="flash">{{item}}</div>
+                {% endfor %}
+            {% endwith %}
+            {{body|safe}}
+        </div>
+        <footer>TABARIYAN LEGENDS</footer>
     </body>
     </html>
-    """, title=title)
+    """, body=body)
 
 
-# ---------------- HOME ----------------
+# ==================================================
+# AUTH
+# ==================================================
 
-@app.route("/")
-def home():
-    con = db()
-
-    players = con.execute(
-        "SELECT * FROM users WHERE role='player' ORDER BY goals DESC"
-    ).fetchall()
-
-    matches = con.execute(
-        "SELECT * FROM matches ORDER BY id DESC LIMIT 3"
-    ).fetchall()
-
-    content = """
-    <div class="card">
-        <h2>به وب سایت رسمی تیم خوش آمدید</h2>
-        <h3>💙 TABARIYAN LEGENDS ❤️</h3>
-
-        <p>
-            خانه رسمی تیم فوتبال طبریان لجندز.
-            اخبار، بازیکنان، آمار و مسابقات تیم را دنبال کنید.
-        </p>
-
-        <a class="btn" href="{{ url_for('players') }}">
-            مشاهده بازیکنان
-        </a>
-
-        <a class="btn" href="{{ url_for('matches') }}">
-            مسابقات
-        </a>
-    </div>
-
-    <div class="card">
-        <h2>آمار تیم</h2>
-        <div class="stat-grid">
-            <div class="stat">
-                تعداد بازیکنان
-                <strong>{{ players|length }}</strong>
-            </div>
-            <div class="stat">
-                تعداد مسابقات
-                <strong>{{ matches|length }}</strong>
-            </div>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>بازیکنان برتر</h2>
-
-        {% for p in players[:5] %}
-        <div class="player">
-            <b>{{ p.username }}</b>
-            <p>گل: {{ p.goals }} | پاس گل: {{ p.assists }}</p>
-            <a href="{{ url_for('player_profile', user_id=p.id) }}">
-                مشاهده پروفایل
-            </a>
-        </div>
-        {% else %}
-        <p>هنوز بازیکنی ثبت نشده است.</p>
-        {% endfor %}
-    </div>
-
-    <div class="card">
-        <h2>آخرین مسابقات</h2>
-
-        {% for m in matches %}
-        <div class="player">
-            مقابل: {{ m.opponent }}
-            <h3>{{ m.score }}</h3>
-            نتیجه: {{ m.result }}
-        </div>
-        {% else %}
-        <p>هنوز مسابقه ای ثبت نشده است.</p>
-        {% endfor %}
-    </div>
-    """
-
-    return page(
-        "خانه",
-        render_template_string(
-            content,
-            players=players,
-            matches=matches
-        )
-    )
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("user"):
+            flash("ابتدا وارد حساب شوید.")
+            return redirect("/login")
+        return func(*args, **kwargs)
+    return wrapper
 
 
-# ---------------- REGISTER ----------------
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            flash("دسترسی مدیر لازم است.")
+            return redirect("/login")
+        return func(*args, **kwargs)
+    return wrapper
+
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
-        phone = request.form.get("phone", "").strip()
+        fullname = request.form.get("fullname", "").strip()
         password = request.form.get("password", "")
 
-        if len(username) < 3:
-            flash("نام کاربری باید حداقل ۳ حرف باشد.")
-            return redirect(url_for("register"))
+        if len(username) < 3 or len(password) < 6:
+            flash("نام کاربری حداقل ۳ و رمز حداقل ۶ حرف باشد.")
+            return redirect("/register")
 
-        if len(password) < 6:
-            flash("رمز عبور باید حداقل ۶ کاراکتر باشد.")
-            return redirect(url_for("register"))
-
+        con = get_db()
         try:
-            db().execute("""
-                INSERT INTO users (username, phone, password)
-                VALUES (?, ?, ?)
+            con.execute("""
+                INSERT INTO users(username,password,fullname)
+                VALUES(?,?,?)
             """, (
                 username,
-                phone,
-                generate_password_hash(password)
+                generate_password_hash(password),
+                fullname
             ))
-            db().commit()
-
-            flash("ثبت نام با موفقیت انجام شد.")
-            return redirect(url_for("login"))
+            con.commit()
+            flash("ثبت‌نام موفق بود.")
+            return redirect("/login")
 
         except sqlite3.IntegrityError:
-            flash("این نام کاربری قبلاً ثبت شده است.")
-            return redirect(url_for("register"))
+            flash("این نام کاربری قبلاً استفاده شده است.")
 
-    content = """
+        finally:
+            con.close()
+
+    return page("""
     <div class="card">
-        <h2>ثبت نام</h2>
+        <h2>ثبت‌نام</h2>
         <form method="POST">
+            <input name="fullname" placeholder="نام کامل" required>
             <input name="username" placeholder="نام کاربری" required>
-            <input name="phone" placeholder="شماره تماس" type="tel">
-            <input name="password" placeholder="رمز عبور"
-                   type="password" required>
-            <button type="submit">ایجاد حساب</button>
+            <input name="password" type="password"
+                   placeholder="رمز عبور" required>
+            <button>ثبت‌نام</button>
         </form>
-        <p>قبلاً ثبت نام کرده ای؟
-        <a href="{{ url_for('login') }}">ورود</a></p>
     </div>
-    """
-    return page("ثبت نام", content)
+    """)
 
-
-# ---------------- LOGIN ----------------
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -495,198 +457,1131 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
-        user = db().execute(
+        con = get_db()
+        user = con.execute(
             "SELECT * FROM users WHERE username=?",
             (username,)
         ).fetchone()
+        con.close()
 
         if user and check_password_hash(user["password"], password):
             session.clear()
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
-            session["role"] = user["role"]
+            session["user"] = user["username"]
+            session["admin"] = bool(user["is_admin"])
+            flash("با موفقیت وارد شدید.")
+            return redirect("/")
 
-            flash("با موفقیت وارد شدی.")
+        flash("نام کاربری یا رمز اشتباه است.")
 
-            if user["role"] == "admin":
-                return redirect(url_for("admin_panel.dashboard"))
-
-            return redirect(url_for("dashboard"))
-
-        flash("نام کاربری یا رمز عبور اشتباه است.")
-        return redirect(url_for("login"))
-
-    content = """
+    return page("""
     <div class="card">
-        <h2>ورود به حساب</h2>
+        <h2>ورود</h2>
         <form method="POST">
             <input name="username" placeholder="نام کاربری" required>
             <input name="password" type="password"
                    placeholder="رمز عبور" required>
-            <button type="submit">ورود</button>
+            <button>ورود</button>
         </form>
-        <p>حساب نداری؟
-        <a href="{{ url_for('register') }}">ثبت نام</a></p>
     </div>
-    """
-    return page("ورود", content)
+    """)
 
-
-# ---------------- LOGOUT ----------------
 
 @app.route("/logout")
-@login_required
 def logout():
     session.clear()
-    flash("از حساب خارج شدی.")
-    return redirect(url_for("home"))
+    flash("از حساب خارج شدید.")
+    return redirect("/")
 
 
-# ---------------- DASHBOARD ----------------
+# ==================================================
+# HOME
+# ==================================================
 
-@app.route("/dashboard")
-@login_required
-def dashboard():
-    user = db().execute(
-        "SELECT * FROM users WHERE id=?",
-        (session["user_id"],)
-    ).fetchone()
+@app.route("/")
+def home():
+    con = get_db()
 
-    if user is None:
-        session.clear()
-        return redirect(url_for("login"))
+    players = con.execute("""
+        SELECT * FROM users
+        WHERE is_admin=0
+        ORDER BY goals DESC
+        LIMIT 6
+    """).fetchall()
 
-    content = """
-    <div class="card">
-        <h2>حساب کاربری</h2>
-        <h3>خوش آمدی {{ user.username }}</h3>
+    news = con.execute("""
+        SELECT * FROM news
+        ORDER BY id DESC
+        LIMIT 3
+    """).fetchall()
 
-        <div class="stat-grid">
-            {% for label, value in [
-                ('بازی', user.matches),
-                ('گل', user.goals),
-                ('پاس گل', user.assists),
-                ('کلین شیت', user.clean_sheets),
-                ('کارت زرد', user.yellow_cards),
-                ('کارت قرمز', user.red_cards),
-                ('امتیاز', user.rating)
-            ] %}
-            <div class="stat">
-                {{ label }}
-                <strong>{{ value }}</strong>
-            </div>
-            {% endfor %}
-        </div>
+    con.close()
+
+    return page("""
+    <div class="hero">
+        <h1>💙 TABARIYAN LEGENDS ❤️</h1>
+        <h3>وب‌سایت رسمی تیم</h3>
+        <p>قدرت، اتحاد و افتخار</p>
+        <a class="btn" href="/players">بازیکنان</a>
+        <a class="btn" href="/news">اخبار</a>
     </div>
-    """
-    return page(
-        "حساب من",
-        render_template_string(content, user=user)
-    )
+
+    <h2>بازیکنان برتر</h2>
+    <div class="grid">
+    {% for p in players %}
+        <div class="player">
+            <h3>{{p.fullname or p.username}}</h3>
+            <p>شماره: {{p.number}}</p>
+            <p>پست: {{p.position}}</p>
+            <p>گل: {{p.goals}} | پاس گل: {{p.assists}}</p>
+            <a href="/profile?username={{p.username}}">پروفایل</a>
+        </div>
+    {% else %}
+        <div class="card">بازیکنی ثبت نشده است.</div>
+    {% endfor %}
+    </div>
+
+    <h2>آخرین اخبار</h2>
+    {% for n in news %}
+        <div class="card">
+            <h3>{{n.title}}</h3>
+            <p>{{n.content}}</p>
+            {% if n.poster %}
+                <img class="poster" src="/uploads/{{n.poster}}">
+            {% endif %}
+        </div>
+    {% else %}
+        <div class="card">خبری منتشر نشده است.</div>
+    {% endfor %}
+    """, players=players, news=news)
 
 
-# ---------------- PLAYERS ----------------
+# ==================================================
+# PLAYERS
+# ==================================================
 
 @app.route("/players")
 def players():
-    players_list = db().execute(
-        "SELECT * FROM users WHERE role='player' ORDER BY goals DESC"
-    ).fetchall()
+    con = get_db()
+    data = con.execute("""
+        SELECT * FROM users
+        WHERE is_admin=0
+        ORDER BY goals DESC, assists DESC
+    """).fetchall()
+    con.close()
 
-    content = """
-    <div class="card">
-        <h2>بازیکنان تیم</h2>
-
-        {% for p in players %}
+    return page("""
+    <h2>بازیکنان تیم</h2>
+    <div class="grid">
+    {% for p in players %}
         <div class="player">
-            <h3>{{ p.username }}</h3>
-            گل: {{ p.goals }} | پاس گل: {{ p.assists }}
-            <br><br>
-            <a href="{{ url_for('player_profile', user_id=p.id) }}">
-                مشاهده پروفایل
-            </a>
+            <h3>{{p.fullname or p.username}}</h3>
+            <p>شماره: {{p.number}}</p>
+            <p>پست: {{p.position}}</p>
+            <p>گل: {{p.goals}}</p>
+            <p>پاس گل: {{p.assists}}</p>
+            <a href="/profile?username={{p.username}}">مشاهده پروفایل</a>
         </div>
-        {% else %}
-        <p>بازیکنی ثبت نشده است.</p>
-        {% endfor %}
+    {% else %}
+        <div class="card">بازیکنی وجود ندارد.</div>
+    {% endfor %}
     </div>
-    """
-    return page(
-        "بازیکنان",
-        render_template_string(content, players=players_list)
+    """, players=data)
+
+
+# ==================================================
+# PROFILE
+# ==================================================
+
+@app.route("/profile", methods=["GET", "POST"])
+@login_required
+def profile():
+    username = request.args.get("username", session["user"])
+
+    can_edit = (
+        username == session["user"] or session.get("admin")
     )
 
+    if request.method == "POST":
+        if not can_edit:
+            flash("اجازه ویرایش ندارید.")
+            return redirect("/profile")
 
-# ---------------- PLAYER PROFILE ----------------
+        fullname = request.form.get("fullname", "").strip()
+        position = request.form.get("position", "").strip()
 
-@app.route("/player/<int:user_id>")
-def player_profile(user_id):
-    player = db().execute(
-        "SELECT * FROM users WHERE id=? AND role='player'",
-        (user_id,)
+        try:
+            number = max(0, int(request.form.get("number", 0)))
+        except ValueError:
+            number = 0
+
+        con = get_db()
+        con.execute("""
+            UPDATE users
+            SET fullname=?, position=?, number=?
+            WHERE username=?
+        """, (fullname, position, number, username))
+        con.commit()
+        con.close()
+
+        flash("پروفایل ذخیره شد.")
+        return redirect(url_for("profile", username=username))
+
+    con = get_db()
+    user = con.execute(
+        "SELECT * FROM users WHERE username=?",
+        (username,)
     ).fetchone()
+    con.close()
 
-    if player is None:
-        return page(
-            "یافت نشد",
-            "<div class='card'><h2>بازیکن پیدا نشد.</h2></div>"
-        ), 404
+    if not user:
+        flash("کاربر پیدا نشد.")
+        return redirect("/players")
 
-    content = """
+    return page("""
     <div class="card">
-        <h2>پروفایل بازیکن</h2>
-        <h1>{{ player.username }}</h1>
+        <h2>پروفایل {{user.fullname or user.username}}</h2>
+        <p>نام کاربری: {{user.username}}</p>
+        <p>شماره: {{user.number}}</p>
+        <p>پست: {{user.position}}</p>
+        <p>گل: {{user.goals}}</p>
+        <p>پاس گل: {{user.assists}}</p>
 
-        <div class="stat-grid">
-            <div class="stat">بازی<strong>{{ player.matches }}</strong></div>
-            <div class="stat">گل<strong>{{ player.goals }}</strong></div>
-            <div class="stat">پاس گل<strong>{{ player.assists }}</strong></div>
-            <div class="stat">کلین شیت<strong>{{ player.clean_sheets }}</strong></div>
-            <div class="stat">امتیاز<strong>{{ player.rating }}</strong></div>
-        </div>
+        {% if can_edit %}
+        <hr>
+        <h3>ویرایش پروفایل</h3>
+        <form method="POST">
+            <input name="fullname" value="{{user.fullname}}"
+                   placeholder="نام کامل">
+            <input name="position" value="{{user.position}}"
+                   placeholder="پست بازی">
+            <input name="number" type="number"
+                   value="{{user.number}}" placeholder="شماره">
+            <button>ذخیره</button>
+        </form>
+        {% endif %}
     </div>
-    """
-    return page(
-        "پروفایل",
-        render_template_string(content, player=player)
-    )
+    """, user=user, can_edit=can_edit)
 
 
-# ---------------- MATCHES ----------------
+# ==================================================
+# NEWS
+# ==================================================
 
-@app.route("/matches")
-def matches():
-    matches_list = db().execute(
-        "SELECT * FROM matches ORDER BY id DESC"
+@app.route("/news")
+def news():
+    con = get_db()
+    items = con.execute(
+        "SELECT * FROM news ORDER BY id DESC"
+    ).fetchall()
+    con.close()
+
+    return page("""
+    <h2>اخبار تیم</h2>
+    {% for n in news %}
+        <div class="card">
+            <h3>{{n.title}}</h3>
+            <p>{{n.content}}</p>
+            {% if n.poster %}
+                <img class="poster" src="/uploads/{{n.poster}}">
+            {% endif %}
+            <small>نویسنده: {{n.author}}</small>
+        </div>
+    {% else %}
+        <div class="card">هنوز خبری منتشر نشده است.</div>
+    {% endfor %}
+    """, news=items)
+
+
+@app.route("/uploads/<path:filename>")
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+# ==================================================
+# ADMIN
+# ==================================================
+
+@app.route("/admin", methods=["GET", "POST"])
+@admin_required
+def admin():
+    con = get_db()
+
+    if request.method == "POST":
+        action = request.form.get("action")
+
+        if action == "add_player":
+            username = request.form.get("username", "").strip()
+            fullname = request.form.get("fullname", "").strip()
+            password = request.form.get("password", "")
+
+            if len(username) < 3 or len(password) < 6:
+                flash("نام کاربری یا رمز معتبر نیست.")
+            else:
+                try:
+                    con.execute("""
+                        INSERT INTO users(username,password,fullname)
+                        VALUES(?,?,?)
+                    """, (
+                        username,
+                        generate_password_hash(password),
+                        fullname
+                    ))
+                    con.commit()
+                    flash("بازیکن اضافه شد.")
+                except sqlite3.IntegrityError:
+                    flash("نام کاربری تکراری است.")
+
+        elif action == "update_stats":
+            username = request.form.get("username", "")
+
+            try:
+                goals = max(0, int(request.form.get("goals", 0)))
+                assists = max(0, int(request.form.get("assists", 0)))
+            except ValueError:
+                goals = assists = 0
+
+            con.execute("""
+                UPDATE users SET goals=?, assists=?
+                WHERE username=? AND is_admin=0
+            """, (goals, assists, username))
+            con.commit()
+            flash("آمار ذخیره شد.")
+
+        elif action == "delete_player":
+            username = request.form.get("username", "")
+
+            if username != ADMIN_USERNAME:
+                con.execute("""
+                    DELETE FROM users
+                    WHERE username=? AND is_admin=0
+                """, (username,))
+                con.commit()
+                flash("بازیکن حذف شد.")
+
+        elif action == "add_news":
+            title = request.form.get("title", "").strip()
+            content = request.form.get("content", "").strip()
+            poster = request.files.get("poster")
+            filename = ""
+
+            if poster and poster.filename:
+                safe_name = secure_filename(poster.filename)
+                extension = os.path.splitext(safe_name)[1].lower()
+
+                if extension not in [".jpg", ".jpeg", ".png", ".webp"]:
+                    flash("فرمت پوستر نامعتبر است.")
+                    con.close()
+                    return redirect("/admin")
+
+                filename = secrets.token_hex(12) + extension
+                poster.save(os.path.join(UPLOAD_DIR, filename))
+
+            if title:
+                con.execute("""
+                    INSERT INTO news(title,content,poster,author)
+                    VALUES(?,?,?,?)
+                """, (
+                    title, content, filename, session["user"]
+                ))
+                con.commit()
+                flash("خبر منتشر شد.")
+
+        elif action == "delete_news":
+            try:
+                news_id = int(request.form.get("news_id", 0))
+            except ValueError:
+                news_id = 0
+
+            item = con.execute(
+                "SELECT poster FROM news WHERE id=?",
+                (news_id,)
+            ).fetchone()
+
+            if item:
+                con.execute(
+                    "DELETE FROM news WHERE id=?",
+                    (news_id,)
+                )
+                con.commit()
+
+                if item["poster"]:
+                    path = os.path.join(UPLOAD_DIR, item["poster"])
+                    if os.path.isfile(path):
+                        os.remove(path)
+
+                flash("خبر حذف شد.")
+
+    players_data = con.execute("""
+        SELECT * FROM users
+        WHERE is_admin=0
+        ORDER BY username
+    """).fetchall()
+
+    news_data = con.execute(
+        "SELECT * FROM news ORDER BY id DESC"
     ).fetchall()
 
-    content = """
-    <div class="card">
-        <h2>مسابقات تیم</h2>
+    con.close()
 
-        {% for m in matches %}
-        <div class="player">
-            <h3>TABARIYAN LEGENDS VS {{ m.opponent }}</h3>
-            <h2>{{ m.score }}</h2>
-            نتیجه: {{ m.result }}
-            <p>تاریخ: {{ m.match_date or 'ثبت نشده' }}</p>
-        </div>
-        {% else %}
-        <p>هنوز مسابقه ای ثبت نشده است.</p>
+    return page("""
+    <div class="card">
+        <h2>پنل مدیریت</h2>
+        <p>مدیریت TABARIYAN LEGENDS</p>
+    </div>
+
+    <div class="card">
+        <h2>افزودن بازیکن</h2>
+        <form method="POST">
+            <input type="hidden" name="action" value="add_player">
+            <input name="fullname" placeholder="نام کامل" required>
+            <input name="username" placeholder="نام کاربری" required>
+            <input name="password" type="password"
+                   placeholder="رمز عبور" required>
+            <button>افزودن</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>مدیریت آمار</h2>
+        {% for p in players %}
+        <form method="POST" class="player">
+            <input type="hidden" name="action" value="update_stats">
+            <input type="hidden" name="username" value="{{p.username}}">
+            <b>{{p.fullname or p.username}}</b>
+            <input type="number" name="goals"
+                   value="{{p.goals}}" min="0">
+            <input type="number" name="assists"
+                   value="{{p.assists}}" min="0">
+            <button>ذخیره آمار</button>
+        </form>
         {% endfor %}
     </div>
-    """
-    return page(
-        "مسابقات",
-        render_template_string(content, matches=matches_list)
-    )
+
+    <div class="card">
+        <h2>حذف بازیکن</h2>
+        {% for p in players %}
+        <form method="POST">
+            <input type="hidden" name="action" value="delete_player">
+            <input type="hidden" name="username" value="{{p.username}}">
+            <button>حذف {{p.fullname or p.username}}</button>
+        </form>
+        {% endfor %}
+    </div>
+
+    <div class="card">
+        <h2>انتشار خبر و پوستر</h2>
+        <form method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="action" value="add_news">
+            <input name="title" placeholder="عنوان خبر" required>
+            <textarea name="content" placeholder="متن خبر"></textarea>
+            <input type="file" name="poster"
+                   accept=".jpg,.jpeg,.png,.webp">
+            <button>انتشار خبر</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>حذف اخبار</h2>
+        {% for n in news %}
+        <form method="POST">
+            <input type="hidden" name="action" value="delete_news">
+            <input type="hidden" name="news_id" value="{{n.id}}">
+            <b>{{n.title}}</b>
+            <button>حذف خبر</button>
+        </form>
+        {% endfor %}
+    </div>
+    """, players=players_data, news=news_data)
 
 
-# ---------------- RUN ----------------
+# ==================================================
+# CHAT
+# ==================================================
+
+def private_room(user1, user2):
+    return "private_" + "_".join(sorted([user1, user2]))
+
+
+def get_chat_messages(username, target):
+    con = get_db()
+
+    if target == "TEAM":
+        data = con.execute("""
+            SELECT * FROM messages
+            WHERE receiver='TEAM'
+            ORDER BY id DESC LIMIT 100
+        """).fetchall()
+    else:
+        data = con.execute("""
+            SELECT * FROM messages
+            WHERE
+            (sender=? AND receiver=?)
+            OR
+            (sender=? AND receiver=?)
+            ORDER BY id DESC LIMIT 100
+        """, (
+            username, target,
+            target, username
+        )).fetchall()
+
+    con.close()
+    return list(reversed(data))
+
+
+@app.route("/chat")
+@login_required
+def chat():
+    username = session["user"]
+    target = request.args.get("user", "TEAM")
+
+    con = get_db()
+
+    if target != "TEAM":
+        user = con.execute(
+            "SELECT id FROM users WHERE username=?",
+            (target,)
+        ).fetchone()
+
+        if not user or target == username:
+            con.close()
+            flash("کاربر معتبر نیست.")
+            return redirect("/chat")
+
+    users = con.execute("""
+        SELECT username,fullname FROM users
+        WHERE username != ?
+        ORDER BY username
+    """, (username,)).fetchall()
+
+    con.close()
+
+    messages = get_chat_messages(username, target)
+
+    return page("""
+    <div class="card">
+        <h2>پیام‌رسان TABARIYAN LEGENDS</h2>
+
+        <p>کاربر: {{username}}</p>
+
+        <a class="btn" href="/chat">گروه تیم</a>
+
+        {% for u in users %}
+            <a class="btn" href="/chat?user={{u.username}}">
+                {{u.fullname or u.username}}
+            </a>
+        {% endfor %}
+
+        <hr>
+        <h3>
+            {% if target == "TEAM" %}
+                گفت‌وگوی گروهی تیم
+            {% else %}
+                گفت‌وگوی خصوصی با {{target}}
+            {% endif %}
+        </h3>
+
+        <div id="messages">
+            {% for m in messages %}
+            <div class="message">
+                <b>{{m.sender}}</b>
+                <p>{{m.message}}</p>
+                <small>{{m.created_at}}</small>
+            </div>
+            {% endfor %}
+        </div>
+
+        <input id="msg" placeholder="پیام خود را بنویسید">
+        <button onclick="sendMessage()">ارسال پیام</button>
+        <p id="status"></p>
+    </div>
+
+    <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+    <script>
+    const socket = io();
+    const target = {{target|tojson}};
+
+    socket.on("connect", () => {
+        socket.emit("join_chat", {target: target});
+        document.getElementById("status").textContent = "متصل شدی";
+    });
+
+    socket.on("connect_error", () => {
+        document.getElementById("status").textContent =
+            "ارتباط با سرور برقرار نشد.";
+    });
+
+    socket.on("new_message", m => {
+        const box = document.getElementById("messages");
+        const div = document.createElement("div");
+        div.className = "message";
+
+        const name = document.createElement("b");
+        name.textContent = m.sender;
+
+        const text = document.createElement("p");
+        text.textContent = m.message;
+
+        const time = document.createElement("small");
+        time.textContent = m.created_at;
+
+        div.append(name, text, time);
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+    });
+
+    function sendMessage() {
+        const input = document.getElementById("msg");
+        const message = input.value.trim();
+
+        if (!message) return;
+
+        socket.emit("send_message", {
+            target: target,
+            message: message
+        });
+
+        input.value = "";
+    }
+
+    document.getElementById("msg").addEventListener("keydown", e => {
+        if (e.key === "Enter") sendMessage();
+    });
+    </script>
+    """, username=username, target=target,
+         users=users, messages=messages)
+
+
+# ==================================================
+# CHAT SOCKET EVENTS
+# ==================================================
+
+@socketio.on("connect")
+def socket_connect(auth=None):
+    username = session.get("user")
+
+    if not username:
+        return False
+
+    online_users[username] = request.sid
+
+
+@socketio.on("disconnect")
+def socket_disconnect(reason=None):
+    sid = request.sid
+
+    for username, user_sid in list(online_users.items()):
+        if user_sid == sid:
+            del online_users[username]
+
+
+@socketio.on("join_chat")
+def join_chat(data):
+    username = session.get("user")
+
+    if not username:
+        return
+
+    target = str(data.get("target", "TEAM"))
+
+    if target == "TEAM":
+        join_room("TEAM")
+        return
+
+    con = get_db()
+    user = con.execute(
+        "SELECT id FROM users WHERE username=?",
+        (target,)
+    ).fetchone()
+    con.close()
+
+    if user and target != username:
+        join_room(private_room(username, target))
+
+
+@socketio.on("send_message")
+def send_message(data):
+    username = session.get("user")
+
+    if not username:
+        return
+
+    target = str(data.get("target", "TEAM"))
+    message = str(data.get("message", "")).strip()
+
+    if not message or len(message) > 2000:
+        return
+
+    if target != "TEAM":
+        con = get_db()
+        user = con.execute(
+            "SELECT id FROM users WHERE username=?",
+            (target,)
+        ).fetchone()
+        con.close()
+
+        if not user or target == username:
+            return
+
+    con = get_db()
+
+    con.execute("""
+        INSERT INTO messages(sender,receiver,message)
+        VALUES(?,?,?)
+    """, (username, target, message))
+
+    con.commit()
+
+    row = con.execute("""
+        SELECT * FROM messages ORDER BY id DESC LIMIT 1
+    """).fetchone()
+
+    con.close()
+
+    payload = {
+        "sender": row["sender"],
+        "message": row["message"],
+        "created_at": row["created_at"]
+    }
+
+    if target == "TEAM":
+        socketio.emit("new_message", payload, room="TEAM")
+    else:
+        socketio.emit(
+            "new_message",
+            payload,
+            room=private_room(username, target)
+        )
+
+
+# ==================================================
+# CALL PAGE
+# ==================================================
+
+@app.route("/call")
+@login_required
+def call():
+    username = session["user"]
+
+    con = get_db()
+    users = con.execute("""
+        SELECT username,fullname FROM users
+        WHERE username != ?
+        ORDER BY username
+    """, (username,)).fetchall()
+    con.close()
+
+    return page("""
+    <div class="card">
+        <h2>تماس صوتی و تصویری</h2>
+
+        <select id="target">
+            <option value="">انتخاب بازیکن</option>
+            {% for u in users %}
+            <option value="{{u.username}}">
+                {{u.fullname or u.username}}
+            </option>
+            {% endfor %}
+        </select>
+
+        <button onclick="startCall(false)">تماس صوتی</button>
+        <button onclick="startCall(true)">تماس تصویری</button>
+        <button onclick="endCall()">پایان تماس</button>
+
+        <h3 id="callStatus">آماده تماس</h3>
+
+        <div id="incoming" style="display:none">
+            <p id="caller"></p>
+            <button onclick="answerCall()">پاسخ</button>
+            <button onclick="rejectCall()">رد تماس</button>
+        </div>
+
+        <h3>تصویر شما</h3>
+        <video id="localVideo" autoplay muted playsinline></video>
+
+        <h3>تصویر طرف مقابل</h3>
+        <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+
+    <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+    <script>
+    const socket = io();
+
+    let pc = null;
+    let localStream = null;
+    let incomingOffer = null;
+    let currentPeer = null;
+    let pendingCandidates = [];
+
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+    const callStatus = document.getElementById("callStatus");
+
+    function setStatus(text) {
+        callStatus.textContent = text;
+    }
+
+    function createPeer() {
+        pc = new RTCPeerConnection({
+            iceServers: [
+                {urls:"stun:stun.l.google.com:19302"}
+            ]
+        });
+
+        pc.onicecandidate = event => {
+            if (event.candidate && currentPeer) {
+                socket.emit("call_ice", {
+                    target: currentPeer,
+                    candidate: event.candidate
+                });
+            }
+        };
+
+        pc.ontrack = event => {
+            remoteVideo.srcObject = event.streams[0];
+        };
+
+        pc.onconnectionstatechange = () => {
+            if (!pc) return;
+
+            if (pc.connectionState === "connected") {
+                setStatus("تماس برقرار شد");
+            } else if (pc.connectionState === "failed") {
+                setStatus("ارتباط ناموفق بود؛ ممکن است TURN لازم باشد.");
+            }
+        };
+    }
+
+    async function getMedia(video) {
+        localStream = await navigator.mediaDevices.getUserMedia({
+            audio:true,
+            video:video
+        });
+
+        localVideo.srcObject = localStream;
+    }
+
+    async function startCall(video) {
+        const target = document.getElementById("target").value;
+
+        if (!target) {
+            alert("ابتدا بازیکن را انتخاب کن.");
+            return;
+        }
+
+        if (!navigator.mediaDevices ||
+            !navigator.mediaDevices.getUserMedia) {
+            alert("برای تماس از HTTPS یا localhost استفاده کن.");
+            return;
+        }
+
+        try {
+            currentPeer = target;
+            pendingCandidates = [];
+
+            await getMedia(video);
+            createPeer();
+
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            socket.emit("call_offer", {
+                target:target,
+                offer:offer,
+                video:video
+            });
+
+            setStatus("در انتظار پاسخ...");
+        } catch (error) {
+            console.error(error);
+            setStatus("دسترسی به دوربین یا میکروفون ممکن نشد.");
+            cleanupMedia();
+        }
+    }
+
+    socket.on("incoming_call", data => {
+        if (pc || localStream) {
+            socket.emit("call_reject", {target:data.from});
+            return;
+        }
+
+        incomingOffer = data;
+        currentPeer = data.from;
+
+        document.getElementById("caller").textContent =
+            "تماس از طرف " + data.from;
+
+        document.getElementById("incoming").style.display = "block";
+        setStatus("تماس ورودی");
+    });
+
+    async function answerCall() {
+        if (!incomingOffer) return;
+
+        try {
+            await getMedia(!!incomingOffer.video);
+            createPeer();
+
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });
+
+            await pc.setRemoteDescription(
+                new RTCSessionDescription(incomingOffer.offer)
+            );
+
+            for (const candidate of pendingCandidates) {
+                await pc.addIceCandidate(
+                    new RTCIceCandidate(candidate)
+                );
+            }
+            pendingCandidates = [];
+
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+
+            socket.emit("call_answer", {
+                target:currentPeer,
+                answer:answer
+            });
+
+            document.getElementById("incoming").style.display = "none";
+            incomingOffer = null;
+            setStatus("در حال برقراری تماس...");
+        } catch (error) {
+            console.error(error);
+            setStatus("پاسخ به تماس ناموفق بود.");
+            cleanupMedia();
+        }
+    }
+
+    function rejectCall() {
+        if (currentPeer) {
+            socket.emit("call_reject", {target:currentPeer});
+        }
+
+        cleanupMedia();
+        document.getElementById("incoming").style.display = "none";
+        setStatus("تماس رد شد");
+    }
+
+    socket.on("call_answer_received", async data => {
+        if (!pc) return;
+
+        try {
+            await pc.setRemoteDescription(
+                new RTCSessionDescription(data.answer)
+            );
+
+            for (const candidate of pendingCandidates) {
+                await pc.addIceCandidate(
+                    new RTCIceCandidate(candidate)
+                );
+            }
+            pendingCandidates = [];
+        } catch (error) {
+            console.error(error);
+        }
+    });
+
+    socket.on("call_ice_received", async data => {
+        if (!pc || !pc.remoteDescription) {
+            pendingCandidates.push(data.candidate);
+            return;
+        }
+
+        try {
+            await pc.addIceCandidate(
+                new RTCIceCandidate(data.candidate)
+            );
+        } catch (error) {
+            console.error(error);
+        }
+    });
+
+    socket.on("call_ended", () => {
+        cleanupMedia();
+        setStatus("تماس پایان یافت");
+    });
+
+    socket.on("call_unavailable", () => {
+        cleanupMedia();
+        setStatus("کاربر در دسترس نیست.");
+    });
+
+    function cleanupMedia() {
+        if (pc) {
+            pc.close();
+            pc = null;
+        }
+
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+            localStream = null;
+        }
+
+        localVideo.srcObject = null;
+        remoteVideo.srcObject = null;
+        incomingOffer = null;
+        currentPeer = null;
+        pendingCandidates = [];
+    }
+
+    function endCall() {
+        if (currentPeer) {
+            socket.emit("call_end", {target:currentPeer});
+        }
+
+        cleanupMedia();
+        document.getElementById("incoming").style.display = "none";
+        setStatus("تماس پایان یافت");
+    }
+    </script>
+    """, username=username)
+
+
+# ==================================================
+# CALL SIGNALING
+# ==================================================
+
+def send_to_user(username, event, data):
+    sid = online_users.get(username)
+
+    if sid:
+        socketio.emit(event, data, to=sid)
+        return True
+
+    return False
+
+
+@socketio.on("call_offer")
+def call_offer(data):
+    sender = session.get("user")
+
+    if not sender:
+        return
+
+    target = str(data.get("target", ""))
+
+    if not target or target == sender:
+        return
+
+    con = get_db()
+    exists = con.execute(
+        "SELECT id FROM users WHERE username=?",
+        (target,)
+    ).fetchone()
+    con.close()
+
+    if not exists:
+        return
+
+    payload = {
+        "from":sender,
+        "offer":data.get("offer"),
+        "video":bool(data.get("video"))
+    }
+
+    if not send_to_user(target, "incoming_call", payload):
+        emit("call_unavailable")
+
+
+@socketio.on("call_answer")
+def call_answer(data):
+    sender = session.get("user")
+
+    if not sender:
+        return
+
+    target = str(data.get("target", ""))
+
+    send_to_user(target, "call_answer_received", {
+        "from":sender,
+        "answer":data.get("answer")
+    })
+
+
+@socketio.on("call_ice")
+def call_ice(data):
+    sender = session.get("user")
+
+    if not sender:
+        return
+
+    target = str(data.get("target", ""))
+
+    send_to_user(target, "call_ice_received", {
+        "from":sender,
+        "candidate":data.get("candidate")
+    })
+
+
+@socketio.on("call_reject")
+def call_reject(data):
+    sender = session.get("user")
+
+    if not sender:
+        return
+
+    target = str(data.get("target", ""))
+
+    send_to_user(target, "call_ended", {"from":sender})
+
+
+@socketio.on("call_end")
+def call_end(data):
+    sender = session.get("user")
+
+    if not sender:
+        return
+
+    target = str(data.get("target", ""))
+
+    send_to_user(target, "call_ended", {"from":sender})
+
+
+# ==================================================
+# ERROR HANDLERS
+# ==================================================
+
+@app.errorhandler(404)
+def not_found(error):
+    return page("""
+    <div class="card">
+        <h2>صفحه پیدا نشد</h2>
+        <a class="btn" href="/">بازگشت به خانه</a>
+    </div>
+    """), 404
+
+
+@app.errorhandler(413)
+def too_large(error):
+    return page("""
+    <div class="card">
+        <h2>حجم فایل زیاد است</h2>
+        <p>حداکثر حجم فایل ۵ مگابایت است.</p>
+    </div>
+    """), 413
+
+
+# ==================================================
+# RUN
+# ==================================================
 
 if __name__ == "__main__":
-    app.run(
-        debug=True,
+    print("================================")
+    print("TABARIYAN LEGENDS")
+    print("http://127.0.0.1:5000")
+    print("================================")
+
+    socketio.run(
+        app,
         host="127.0.0.1",
-        port=5000
+        port=5000,
+        debug=True,
+        allow_unsafe_werkzeug=True
     )
+
