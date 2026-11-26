@@ -3,6 +3,7 @@ import sqlite3
 import secrets
 from functools import wraps
 from datetime import datetime
+from flask import session, redirect, url_for, render_template_string
 
 from flask import (
     Flask, request, redirect, url_for, session,
@@ -24,6 +25,43 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
+
+@app.route("/admin")
+def admin_panel():
+    if not session.get("is_admin"):
+        return redirect("/login")
+
+    return render_template_string("""
+    <html>
+    <head>
+        <title>Tabariyan City Admin</title>
+        <style>
+            body {
+                background: #101827;
+                color: white;
+                font-family: Arial;
+                text-align: center;
+                padding: 40px;
+            }
+            .box {
+                background: #1e293b;
+                padding: 25px;
+                border-radius: 15px;
+                max-width: 500px;
+                margin: auto;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h1>🏙️ TABARIYAN CITY</h1>
+            <h2>Admin Panel</h2>
+            <p>خوش آمدی به پنل مدیریت</p>
+        </div>
+    </body>
+    </html>
+    """)
+
 
 app.secret_key = os.environ.get(
     "SECRET_KEY",
