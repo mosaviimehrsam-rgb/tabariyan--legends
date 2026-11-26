@@ -518,7 +518,7 @@ def home():
 
     return page("""
     <div class="hero">
-        <h1>💙 TABARIYAN LEGENDS ❤️</h1>
+        <h1>💙 TABARIYAN CITY ❤️</h1>
         <h3>وب‌سایت رسمی تیم</h3>
         <p>قدرت، اتحاد و افتخار</p>
         <a class="btn" href="/players">بازیکنان</a>
