@@ -4,6 +4,7 @@ import secrets
 from functools import wraps
 from datetime import datetime
 from flask import session, redirect, url_for, render_template_string
+from admin import admin
 
 from flask import (
     Flask, request, redirect, url_for, session,
