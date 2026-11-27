@@ -773,9 +773,20 @@ def admin():
                 except sqlite3.IntegrityError:
                     flash("نام کاربری تکراری است.")
 
-        elif action == "update_stats":
-            username = request.form.get("username", "")
+        
+elif action == "change_goals":
+    username = request.form.get("username", "")
+    change = int(request.form.get("change", 0))
 
+    con.execute("""
+        UPDATE users
+        SET goals = MAX(0, goals + ?)
+        WHERE username=? AND is_admin=0
+    """, (change, username))
+
+    con.commit()
+    flash("تعداد گل تغییر کرد.")
+            
             try:
                 goals = max(0, int(request.form.get("goals", 0)))
                 assists = max(0, int(request.form.get("assists", 0)))
