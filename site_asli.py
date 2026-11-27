@@ -27,6 +27,9 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
 
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
+app.register_blueprint(admin)
+
 @app.route("/admin")
 def admin_panel():
     if not session.get("is_admin"):
